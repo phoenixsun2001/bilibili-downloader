@@ -9,11 +9,17 @@
 - **封面下载** — 单独保存视频封面图片
 - **批量下载** — 支持按 BV 号列表、UP主+关键词、合集链接批量下载
 - **自动目录** — 下载完成后生成 `catalog.csv`，记录 BV 号、标题、UP主、时长等元数据
+- **多工具兜底** — yt-dlp（cookies）→ you-get → yt-dlp（无 cookies），自动处理 B站 412 限流
+- **格式转换** — you-get 下载的 FLV 自动转换为 MP4
+- **浏览器 Cookies** — 自动检测 Safari/Chrome/Edge/Firefox/Brave 中的 B站登录态
 
 ## 环境要求
 
 ```bash
+# 必装
 brew install yt-dlp ffmpeg
+# 推荐（yt-dlp 失败时的备用下载工具）
+pip install you-get
 ```
 
 ## 使用方法
@@ -26,14 +32,23 @@ brew install yt-dlp ffmpeg
 
 Claude Code 会自动加载此 skill 并引导你完成下载配置。
 
-### 手动下载示例
+### 通过脚本手动下载
 
 ```bash
-# 下载单个视频的音频
-PYTHONIOENCODING=utf-8 yt-dlp \
-  -x --audio-format mp3 --audio-quality 0 --embed-thumbnail \
-  -o "%(title)s.%(ext)s" \
-  "https://www.bilibili.com/video/BV1dh4y1L7eS/"
+# 下载音频
+bash scripts/bili-dl.sh audio "BV1dh4y1L7eS" "./output"
+
+# 下载视频
+bash scripts/bili-dl.sh video "BV1dh4y1L7eS" "./output"
+
+# 下载视频 + 提取音频
+bash scripts/bili-dl.sh video+audio "BV1dh4y1L7eS" "./output"
+
+# 下载封面
+bash scripts/bili-dl.sh thumbnail "BV1dh4y1L7eS" "./output"
+
+# 查看视频元数据
+bash scripts/bili-dl.sh metadata "BV1dh4y1L7eS" "./output"
 ```
 
 ## 文件结构
@@ -43,7 +58,8 @@ bilibili-downloader/
 ├── SKILL.md                  # Skill 定义（核心文件）
 ├── references/
 │   └── bilibili-api.md       # B站 API 参考文档
-└── scripts/                  # 动态脚本目录（skill 运行时自动生成）
+└── scripts/
+    └── bili-dl.sh            # 下载脚本（多工具兜底 + 自动格式转换）
 ```
 
 ## 注意事项
