@@ -1,0 +1,5 @@
+.DS_Store
+*.tmp
+cookies*.txt
+__pycache__/
+*.pyc
