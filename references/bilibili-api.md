@@ -66,13 +66,50 @@ GET https://api.bilibili.com/x/web-interface/search/type?search_type=video&keywo
 
 This endpoint often requires WBI signature verification. **Prefer web search over this API** for finding videos by keyword. The API frequently returns captcha pages for automated access.
 
-### User space videos (requires WBI signature)
+### User space videos (WBI-signed — reliable when signed correctly)
 
 ```
-GET https://api.bilibili.com/x/space/wbi/arc/search?mid={UID}&keyword={KEYWORD}&ps=30&pn=1
+GET https://api.bilibili.com/x/space/wbi/arc/search?mid={UID}&ps=30&pn=1&order=pubdate
 ```
 
-This endpoint requires WBI signature (signed query parameters). The signing keys rotate periodically. For simplicity, prefer web search + related-videos API traversal.
+This endpoint requires WBI signature (verified working 2026-10 — returns the UP主's videos
+newest-first with `created` timestamps; ideal for "latest N videos after date X" requests).
+Rate-limits rapid successive calls (HTTP 412) — add `sleep 3` between pages and retry.
+
+**WBI signing recipe** (get the UP主's `mid` from any of their videos via the view API,
+`data.owner.mid`):
+
+```python
+import hashlib, json, time, urllib.parse, urllib.request
+
+MIXIN = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,
+         33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,
+         61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,
+         36,20,34,44,52]
+
+def get(url):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 ...", "Referer": "https://www.bilibili.com/"})
+    return json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
+
+nav = get("https://api.bilibili.com/x/web-interface/nav")["data"]["wbi_img"]
+raw = (nav["img_url"].rsplit("/", 1)[1].split(".")[0] +
+       nav["sub_url"].rsplit("/", 1)[1].split(".")[0])
+mixin_key = "".join(raw[i] for i in MIXIN)[:32]
+
+params = {"mid": "17004561", "ps": "30", "pn": "1", "order": "pubdate",
+          "platform": "web", "web_location": "1550101", "wts": str(int(time.time()))}
+qs = urllib.parse.urlencode(sorted(params.items()))
+params["w_rid"] = hashlib.md5((qs + mixin_key).encode()).hexdigest()
+data = get("https://api.bilibili.com/x/space/wbi/arc/search?" +
+           urllib.parse.urlencode(params))
+# data["data"]["list"]["vlist"] → [{bvid, title, created (unix), length ("43:12"), ...}]
+```
+
+**IMPORTANT — playurl is NOT reachable this way:** `x/player/wbi/playurl` returns 412
+*even with* a correct fresh WBI signature (extra protection beyond signing, verified
+2026-10). Don't hand-roll playurl calls; extract direct stream URLs from `you-get -u`
+output instead (see SKILL.md "audio downloads — audio-only direct path").
 
 ## User info
 

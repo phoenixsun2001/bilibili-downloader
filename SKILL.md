@@ -28,16 +28,19 @@ Bilibili uses WBI signature verification on its playurl API. **yt-dlp very frequ
 
 Bilibili updates its WBI/playurl algorithm often and yt-dlp's extractor lags behind. **Do not waste cycles retrying yt-dlp or upgrading it expecting a fix** — treat 412 as the expected outcome and rely on the you-get fallback instead.
 
+**The playurl API 412s even with a correct, fresh WBI signature** (verified 2026-10: hand-signed `x/player/wbi/playurl` with keys from `nav` still gets 412 — that endpoint has extra protection beyond signing). Don't hand-roll playurl calls. To get direct stream URLs, extract them from `you-get -u` output instead (see the audio-only path below). Note: other WBI-signed endpoints like `x/space/wbi/arc/search` DO work with proper signing — see `references/bilibili-api.md`.
+
 **Policy: anonymous (cookieless) downloads.** The script NEVER uses `--cookies-from-browser` and you should not pass cookies either. Public videos download fine anonymously; videos that gate their stream behind login/payment are detected and **skipped** (see "Charged/Premium-exclusive videos" below). This also avoids the macOS Keychain hang that `--cookies-from-browser chrome` triggers.
 
-**The bundled script `scripts/bili-dl.sh` fallback chain (all cookieless):**
-1. **Charged-video check** → if `is_upower_exclusive`, print `[CHARGED] SKIP: ...` and exit 0 without downloading (no wasted 15-min preview).
-2. **you-get (anonymous; up to 480P/720P depending on the video) — the reliable path.**
-3. yt-dlp cookieless (best-effort; usually 412s, kept as a last resort).
+**The bundled script `scripts/bili-dl.sh` strategy chains (all cookieless):**
+1. **Charged-video check** (all modes) → if `is_upower_exclusive`, print `[CHARGED] SKIP: ...` and exit 0 without downloading (no wasted 15-min preview).
+2. **audio mode → audio-only direct path** (`scripts/bili-audio-only.py`): extracts the audio-stream URL via `you-get -u`, downloads just the audio with curl. Fast, stall-proof, ~60% less data. **This is the primary audio path.**
+3. **video modes → you-get** (anonymous; up to 480P/720P depending on the video), wrapped in a hang watchdog.
+4. yt-dlp cookieless (best-effort; usually 412s, kept as a last resort).
 
 Always prefer using the script over raw commands.
 
-> **Practical note (2026-07):** For a public video, step 1 passes and step 2 (you-get) downloads the file. yt-dlp's 412 is expected noise. For a charged video, step 1 skips cleanly — capture the `[CHARGED] SKIP` line and record it in the catalog as skipped (see Step 5).
+> **Practical note (2026-10):** For audio requests, step 2 succeeds in seconds-to-minutes at full speed (fresh signed URLs are not throttled). For video requests, you-get works but can be slow (see the stall warning below). yt-dlp's 412 is expected noise. For a charged video, step 1 skips cleanly — capture the `[CHARGED] SKIP` line and record it in the catalog as skipped (see Step 5).
 
 ## Critical: you-get needs DASH format names
 
@@ -67,6 +70,37 @@ If you call you-get manually, first list formats then pick one verbatim:
 PYTHONIOENCODING=utf-8 you-get -i "https://www.bilibili.com/video/$bvid/"   # list available formats
 PYTHONIOENCODING=utf-8 you-get --format=dash-flv480-AVC -o "$DIR" "https://www.bilibili.com/video/$bvid/"
 ```
+
+## Critical: audio downloads — never download the video stream (2026-10 field report)
+
+Two hard-won facts about full-format downloads for audio purposes:
+
+1. **you-get stalls and hangs forever.** Bilibili's CDN throttles anonymous transfers (~50kB/s after the first ~100MB), the connection eventually dies mid-stream, and you-get (0.4.1743) has **no resume flag** — `-c` means *cookies*, not *continue* — so it waits on a dead connection indefinitely. Meanwhile the same stream fetched by curl on a **freshly signed URL runs at full speed** (60MB in seconds).
+2. **The audio stream is identical across all video qualities.** `you-get -i` sizes are video+audio combined; for MP3 extraction the video stream is pure waste (~60% of the bytes).
+
+**The fix — audio-only direct path** (bundled as `scripts/bili-audio-only.py`, and the default `audio` strategy in `bili-dl.sh`):
+
+```bash
+# 1. Print real stream URLs without downloading (format choice doesn't matter —
+#    we only take the audio URL from the output)
+PYTHONIOENCODING=utf-8 you-get -u --format=dash-flv480-AVC "https://www.bilibili.com/video/$bvid/"
+# Output contains two .m4s URLs; the AUDIO one matches -30xxx.m4s by stream ID:
+#   30251 (flac) > 30250 (dolby) > 30280 (192k AAC) > 30232 (132k) > 30216 (64k)
+#   (video streams are -300xx/-301xx — ignore them; anonymous gets 30280 at best)
+
+# 2. Download with stall detection + resume
+/usr/bin/curl -C - -o /tmp/audio.m4s \
+  -H "User-Agent: Mozilla/5.0 ..." -H "Referer: https://www.bilibili.com/" \
+  --speed-limit 20480 --speed-time 45 --max-time 600 "$AUDIO_URL"
+# --speed-limit aborts dead connections (<20KB/s for 45s); retry the same command
+# and -C - resumes from the partial file. New URL (re-run step 1) if it expires.
+
+# 3. Convert to MP3 (m4s is plain fMP4; ffmpeg reads it directly)
+ffmpeg -i /tmp/audio.m4s -i cover.jpg -map 0:a -map 1:v -c:v mjpeg \
+  -disposition:v attached_pic -c:a libmp3lame -q:a 0 out.mp3
+```
+
+Prefer calling the bundled script (`bili-dl.sh audio ...`) over doing this by hand — it handles retries, cover embedding, multi-P fallback, and the charged-video check. The python helper is also runnable standalone: `python3 scripts/bili-audio-only.py <bvid> <outdir> [title]` (exit 2/3/4 = fell back needed).
 
 ## Workflow
 
@@ -103,10 +137,11 @@ Use as-is. The user might give one or many.
 **B. UP主 + keyword search**
 When the user says "download all X videos from UP主 Y", you need to find the video list:
 
-1. **Web search first** — Search `"<UP主名>" "<关键词>" site:bilibili.com/video` to find BV numbers. This is the most reliable method because Bilibili's own search API often requires WBI signatures or returns captchas.
-2. **Fallback: related-videos API** — Use `/x/web-interface/archive/related?bvid=BVxxx` to traverse recommendations, filtering by the same UP主 and keyword match.
-3. **Fallback: Bilibili search** — The search API (`/x/web-interface/search/type`) often requires WBI signature. Use only if other methods fail.
-4. Deduplicate by BV number.
+1. **WBI-signed space API (best for "latest N videos" / date-filtered lists)** — `GET /x/space/wbi/arc/search?mid=<mid>&ps=30&pn=1&order=pubdate` returns the UP主's videos newest-first with `created` timestamps, and **works reliably when properly signed** (get keys from `x/web-interface/nav`, apply the mixin-key table + MD5 — full runnable recipe in `references/bilibili-api.md`). Get the `mid` from any known video of the UP主 via the view API (`data.owner.mid`). Add `sleep 3` between pages and retry on 412 — the endpoint rate-limits rapid successive calls.
+2. **Web search** — Search `"<UP主名>" "<关键词>" site:bilibili.com/video` to find BV numbers. Useful for keyword/topic searches where the API list would need client-side filtering anyway; search engines' coverage of recent videos is spotty, which is why the API comes first for date-ordered lists.
+3. **Fallback: related-videos API** — Use `/x/web-interface/archive/related?bvid=BVxxx` to traverse recommendations, filtering by the same UP主 and keyword match.
+4. **Fallback: Bilibili search** — The search API (`/x/web-interface/search/type`) often requires WBI signature. Use only if other methods fail.
+5. Deduplicate by BV number.
 
 **C. Bilibili collection/playlist URL**
 Use yt-dlp's `--flat-playlist` with cookies to enumerate videos.
@@ -203,6 +238,7 @@ Report to the user:
 - **412 Precondition Failed**: Bilibili's WBI signature rejection. The script automatically falls back through: yt-dlp+cookies (each browser) → you-get → yt-dlp no cookies. Do NOT retry the same failed approach.
 - **No cookies / no Keychain**: The script is cookieless by policy — it never calls `--cookies-from-browser`, so there is no cookie extraction to fail and no macOS Keychain prompt to hang on. Don't add `--cookies-from-browser` to "fix" a download; if a video won't yield a full stream anonymously, it's almost certainly charged/login-gated and should be skipped.
 - **you-get quality**: Without login, DASH streams typically cap at **480P** (`dash-flv480-*`; some videos offer 360P only). 720P/1080P usually require login cookies: `you-get --cookies cookies.txt ...`. Always confirm what's actually available with `you-get -i` first.
+- **you-get download stalls (throttle → dead connection → infinite hang)**: Bilibili's CDN throttles anonymous transfers to ~50kB/s after ~100MB, then drops the connection; you-get (0.4.1743) has no resume flag (`-c` is cookies) and waits forever. Symptoms: progress bar frozen for minutes, file mtime not updating. Don't wait it out — kill it. For audio use the audio-only path (fresh signed URLs download at full speed). For video, the script's you-get calls run under a 45-min watchdog; if killed (exit 124), re-running produces a fresh URL/connection which often lands on an unthrottled path.
 - **you-get "oops, something went wrong"**: This is almost always a **stale format name**. Bilibili now uses DASH IDs like `dash-flv480-AVC`; the legacy `flv480`/`mp4` names no longer exist. Re-run `you-get -i` and pass an exact DASH format string *with codec suffix*. The bundled script's `you_get_best_format()` already does this.
 - **Charged/Premium-exclusive videos** (`is_upower_exclusive: true`) — **auto-skipped by the script.** These paid (充电专属) videos gate the full stream behind payment: the playurl API returns only a ~900–930s (~15-min) preview regardless of quality or `fnval` (verified via WBI-signed calls; all return `durl` capped at ~930s, never `dash`). The script checks `is_upower_exclusive` *before* any download attempt, prints `[CHARGED] SKIP: ...`, and writes no file. Record these in the catalog with `下载类型=skipped-charged`. Full download is impossible without paying the UP主, and per the cookieless policy we do not attempt cookie-based workarounds.
 - **DASH/FLV output**: Modern DASH downloads come out as **MP4** directly (video+audio already muxed). FLV output is now rare; the script converts FLV→MP4 with ffmpeg only if an FLV actually appears.
@@ -215,5 +251,6 @@ Report to the user:
 
 ## Reference files
 
-- `references/bilibili-api.md` — Bilibili API endpoints for video discovery and metadata
-- `scripts/bili-dl.sh` — Download helper with multi-tool fallback
+- `references/bilibili-api.md` — Bilibili API endpoints for video discovery and metadata, including the working WBI-signing recipe for the space API
+- `scripts/bili-dl.sh` — Download helper with multi-tool fallback (audio mode: audio-only direct path first)
+- `scripts/bili-audio-only.py` — Standalone audio-only downloader (you-get -u → audio .m4s → curl → MP3 with cover)

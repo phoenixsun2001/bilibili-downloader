@@ -3,10 +3,16 @@
 # Usage: bili-dl.sh <mode> <bvid> <output_dir> [title]
 # Modes: audio, video, video+audio, thumbnail, metadata
 #
-# Download strategy (tried in order):
-#   1. yt-dlp with browser cookies (best quality)
-#   2. you-get (up to 720P, no login needed)
-#   3. yt-dlp without cookies (last resort)
+# Download strategy (tried in order), all cookieless/anonymous:
+#   audio mode:
+#     1. Audio-only direct path (bili-audio-only.py): `you-get -u` extracts the
+#        audio-stream URL, curl downloads just the .m4s (~60% less data, stall-proof,
+#        full speed). THE reliable audio path since 2026-10.
+#     2. you-get full format + ffmpeg extract (fallback; wrapped in a hang watchdog)
+#     3. yt-dlp (usually 412s; last resort)
+#   video modes:
+#     1. yt-dlp (usually 412s on Bilibili's WBI playurl)
+#     2. you-get (up to 480P/720P without login)
 
 set -euo pipefail
 
@@ -80,20 +86,57 @@ yt_dlp_with_retry() {
 }
 
 # --- Download with you-get ---
-# Returns 0 on success, 1 on failure
+# Wrapped in a hang watchdog: Bilibili's CDN throttles anonymous connections and
+# the transfer can die mid-stream, at which point you-get waits forever (it has
+# no resume flag in 0.4.1743 — "-c" means cookies). Kill it after $1 seconds.
+# Usage: you_get_download [timeout_secs] [format]; default timeout 2700 (45min).
+# Returns 0 on success, 1 on failure, 124 on timeout
 you_get_download() {
-    local format="${1:-best}"
+    local timeout_secs="${1:-2700}"
+    local format="${2:-best}"
     if ! has_you_get; then
         echo "[you-get] Not installed, skipping"
         return 1
     fi
 
-    echo "[you-get] Downloading with format=$format..."
-    if PYTHONIOENCODING=utf-8 you-get --format="$format" \
-        -o "$OUTDIR" "$URL" 2>&1; then
-        return 0
+    echo "[you-get] Downloading with format=$format (watchdog: ${timeout_secs}s)..."
+    run_with_timeout "$timeout_secs" \
+        env PYTHONIOENCODING=utf-8 you-get --format="$format" \
+        -o "$OUTDIR" "$URL" 2>&1
+}
+
+# --- Run a command with a hard timeout (macOS ships no GNU `timeout`) ---
+# Usage: run_with_timeout <seconds> <cmd...>. Returns 124 if killed.
+run_with_timeout() {
+    local secs="$1"; shift
+    "$@" &
+    local pid=$!
+    ( sleep "$secs"; kill "$pid" 2>/dev/null ) &
+    local watcher=$!
+    local rc=0
+    wait "$pid" || rc=$?
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    # 143 = SIGTERM from our watcher → normalize to GNU timeout's 124
+    [[ $rc -eq 143 ]] && rc=124
+    return $rc
+}
+
+# --- Audio-only direct path (primary audio strategy since 2026-10) ---
+# Delegates to bili-audio-only.py: extracts the audio-stream URL via `you-get -u`
+# and downloads just the audio .m4s with curl (stall-proof, full speed, ~60% less
+# data than full-format download). See that script's docstring for the field report.
+# Returns 0 on success; nonzero → caller falls back to full download chain.
+audio_only_direct() {
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    local py="$script_dir/bili-audio-only.py"
+    if [[ ! -f "$py" ]] || ! command -v python3 &>/dev/null; then
+        echo "[audio-direct] helper or python3 unavailable, falling back"
+        return 2
     fi
-    return 1
+    echo "[audio-direct] Trying audio-stream-only download (fast path)..."
+    python3 "$py" "$BVID" "$OUTDIR" "$TITLE"
 }
 
 # --- Convert FLV to MP4 if needed ---
@@ -146,12 +189,11 @@ if d.get('code') == 0:
         fi
 
         if [[ -f "$thumb_file" ]]; then
-            # IMPORTANT: put ALL -i inputs first, then output options together.
-            # The previous form ("-i video -vn -acodec ... -i thumb -c copy ...") placed
-            # -q:a before the second input, making ffmpeg reject it with
-            # "Option q:a cannot be applied to input url". Also -c copy conflicted with libmp3lame.
+            # Embed cover art. NO -vn: -vn disables ALL video output and would drop the
+            # mapped thumbnail. Mark the image as an attached_pic (APIC frame) instead.
             ffmpeg -i "$video_file" -i "$thumb_file" \
-                -map 0:a -map 1:0 -vn -c:a libmp3lame -q:a 0 \
+                -map 0:a:0 -map 1:0 -c:a libmp3lame -q:a 0 \
+                -c:v copy -disposition:v:0 attached_pic \
                 -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)" \
                 -id3v2_version 3 "$mp3_file" -y 2>&1 | tail -3
             rm -f "$thumb_file"
@@ -215,10 +257,10 @@ do_video() {
         fi
     fi
 
-    # Strategy 2: you-get
+    # Strategy 2: you-get (with hang watchdog)
     local fmt
     fmt=$(you_get_best_format)
-    if you_get_download "$fmt"; then
+    if you_get_download 2700 "$fmt"; then
         convert_flv_to_mp4
         return 0
     fi
@@ -233,16 +275,13 @@ do_audio() {
 
     echo "[DL] Audio: $TITLE ($BVID)"
 
-    # Strategy 1: yt-dlp audio extraction
-    if has_yt_dlp; then
-        if yt_dlp_with_retry \
-            -x --audio-format mp3 --audio-quality 0 --embed-thumbnail \
-            -o "$OUTDIR/${SAFE_TITLE}.%(ext)s"; then
-            return 0
-        fi
-    fi
+    # Strategy 1 (primary): audio-only direct path — download just the audio
+    # stream. Fast, stall-proof, and the audio is identical to what a full
+    # 480P download would carry. Exits 2 (no URL / charged / multi-P) or 3 (dl
+    # failed) → fall through to the full-download chain below.
+    audio_only_direct && return 0
 
-    # Strategy 2: you-get + ffmpeg extract
+    # Strategy 2: you-get full format + ffmpeg extract
     local video_file
     # Check if video already exists
     for ext in mp4 flv; do
@@ -256,7 +295,7 @@ do_audio() {
     if [[ -z "${video_file:-}" ]]; then
         local fmt
         fmt=$(you_get_best_format)
-        if you_get_download "$fmt"; then
+        if you_get_download 2700 "$fmt"; then
             # Find the downloaded file. you-get names it by the REAL Bilibili title,
             # which may differ from SAFE_TITLE (e.g. halfwidth "," vs fullwidth "，",
             # or "?" vs "？"). Try SAFE_TITLE first, then fall back to the newest
@@ -273,9 +312,15 @@ do_audio() {
         fi
     fi
 
-    if [[ -n "${video_file:-}" ]]; then
-        extract_audio_from_file "$video_file"
-        return $?
+    if [[ -n "${video_file:-}" ]] && extract_audio_from_file "$video_file"; then
+        return 0
+    fi
+
+    # Strategy 3: yt-dlp (usually 412s on Bilibili's playurl; last resort)
+    if has_yt_dlp; then
+        yt_dlp_with_retry \
+            -x --audio-format mp3 --audio-quality 0 --embed-thumbnail \
+            -o "$OUTDIR/${SAFE_TITLE}.%(ext)s" && return 0
     fi
 
     echo "[ERROR] All audio download methods failed for $BVID"
