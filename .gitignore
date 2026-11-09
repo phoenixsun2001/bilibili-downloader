@@ -3,3 +3,8 @@
 cookies*.txt
 __pycache__/
 *.pyc
+
+# Swift / macOS application build output
+.build/
+build/
+.swiftpm/

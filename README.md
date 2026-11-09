@@ -66,3 +66,7 @@ bilibili-downloader/
 ## 许可
 
 MIT
+
+## macOS 图形应用
+
+提供原生 SwiftUI 应用，支持搜索、收藏、UP 主记忆和批量转换 MP3。详见 [macOS 应用使用说明](MACOS_APP.md)。
